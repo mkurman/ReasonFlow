@@ -1,4 +1,4 @@
-# ReasonFlow
+# ReasonFlow 🧠
 
 ReasonFlow is a novel framework designed to implement O(1)-like reasoning capabilities in large language models.  
 It uses Multi-Path Generation with Noise to generate and fuse multiple reasoning paths, robustly handling uncertainty.  
