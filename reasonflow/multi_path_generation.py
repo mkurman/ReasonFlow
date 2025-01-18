@@ -149,9 +149,6 @@ class ReasonFlow(GenerationMixin):
             negative_prompt_attention_mask=None,
         )
 
-        if generation_config.do_sample:
-            self.num_of_thoughts = 1
-
         while num_of_generated_tokens < max_new_tokens:
             with torch.autocast(dtype=getattr(torch, torch_dtype), device_type=device):
                 with torch.no_grad():
@@ -171,7 +168,6 @@ class ReasonFlow(GenerationMixin):
                         cache_position = cache_position[..., -1:].contiguous()
                         position_ids = position_ids[..., -1:].contiguous()
                     
-                        # Track the assigned thinker_id for each row
                     thinker_ids = torch.arange(self.num_of_thinkers, device=batch_input_ids.device).repeat(input_ids["input_ids"].shape[0])
 
                     # Pass all thinkers in one forward call
@@ -222,8 +218,8 @@ class ReasonFlow(GenerationMixin):
 
                     # token selection
                     if generation_config.do_sample:
-                        probs = nn.functional.softmax(result, dim=-1).squeeze()
-                        result = torch.multinomial(probs, num_samples=1).unsqueeze(0).squeeze(-1)
+                        result = torch.clamp(result, 0.0, 1.0)
+                        result = torch.multinomial(result.squeeze(), num_samples=1).unsqueeze(0).squeeze(-1)
                     else:
                         result = torch.argmax(result, dim=-1)
 
