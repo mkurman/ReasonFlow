@@ -63,6 +63,7 @@ class ReasonFlow(GenerationMixin):
         logits_processor: Optional[LogitsProcessorList] = None,
         torch_dtype: str = "float32",
         generation_config: Optional[GenerationConfig] = None,
+        use_tokens: bool = True,
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -77,6 +78,7 @@ class ReasonFlow(GenerationMixin):
             logits_processor (Optional[LogitsProcessorList]): The logits processor.
             torch_dtype (str): The torch data type.
             generation_config (Optional[GenerationConfig]): The generation configuration.
+            use_tokens (bool): Whether to use tokens (True) or internal thoughts (hidden states, False) during thought generation.
             **kwargs: Additional keyword arguments.
 
         Returns:
@@ -184,6 +186,8 @@ class ReasonFlow(GenerationMixin):
                         cache_position=cache_position,
                         position_ids=position_ids,
                         return_dict=True,
+                        use_tokens=use_tokens,
+                        **model_kwargs,
                     )
 
                     # Take only the first new tokens from each thinker

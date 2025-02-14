@@ -29,6 +29,7 @@ def multiple_path_with_noise_inference(
     num_of_thoughts: int = 3,
     acceptance_threshold: float = 0.5,
     temperatures: Optional[torch.Tensor] = [0.7, 1.3],
+    use_tokens: bool = True,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     """
     Perform multiple path inference through the model, allowing for separate thinker paths.
@@ -47,6 +48,7 @@ def multiple_path_with_noise_inference(
         num_of_thoughts (int): Number of thoughts.
         acceptance_threshold (float): Acceptance threshold. Defines the threshold for swapping the probabilities of the top two tokens.
         temperatures (Optional[torch.Tensor]): Temperatures tensor. Defines the temperature for the top two tokens.
+        use_tokens (bool): Whether to use tokens (True) or internal thoughts (hidden states, False) during thought generation. Default is True.
 
     Returns:
         Union[Tuple, CausalLMOutputWithPast]: Model outputs.
@@ -148,7 +150,11 @@ def multiple_path_with_noise_inference(
             else:
                 logits = torch.cat([logits, hidden_states[:, -1:, :].float()], dim=1)
 
-            hidden_states = self.model.embed_tokens(hidden_states[:, -1:, :].argmax(dim=-1))
+            if use_tokens:
+                hidden_states = self.model.embed_tokens(hidden_states[:, -1:, :].argmax(dim=-1))
+            else:
+                hidden_states = hidden_states[:, -1:, :] @ self.lm_head.weight
+                # hidden_states = hidden_states / hidden_states.norm(dim=-1, keepdim=True)
 
             if cache_position is not None:
                 cache_position = cache_position[..., -1:] + 1

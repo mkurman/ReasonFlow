@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ReasonFlow"
+version = "0.1.0"
+description = "Multi-path generation with ReasonFlow."
+authors = [{ name = "Mariusz Kurman", email = "mariusz.kurman@gmail.com" }]
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "transformers==4.46.2",
+    "torch==2.5.1",
+    "jupyter==1.1.1",
+    "einops==0.3.2",
+    "dataclasses",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+where = ["."]
