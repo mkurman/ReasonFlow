@@ -1,14 +1,20 @@
 import torch
 import torch.nn as nn
 from transformers import PreTrainedModel, PreTrainedTokenizer
-from transformers.generation.utils import GenerationMixin, GenerationConfig, LogitsProcessorList
+from transformers.generation.utils import (
+    GenerationMixin,
+    GenerationConfig,
+    LogitsProcessorList,
+)
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Union
 from .utils import has_eos, truncate_output_to_eos
 from .multi_path_forward import multiple_path_with_noise_inference
+from .hooks.last_hs_hook import register_non_norm_hook
 from logging import getLogger
 
 logger = getLogger(__name__)
+
 
 @dataclass
 class ReasonFlowConfig:
@@ -25,16 +31,21 @@ class ReasonFlow(GenerationMixin):
         config: ReasonFlowConfig,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
-        
     ):
         self.config = config
         self.model = model
+
+        # Register the hook to get the non-normalized hidden states
+        register_non_norm_hook(self.model)
+
         self.tokenizer = tokenizer
         self.generation_config = model.generation_config
 
         # Generation Mixin backward compatibility
         self.config.is_encoder_decoder = model.config.is_encoder_decoder
-        self.config._get_non_default_generation_parameters = model.config._get_non_default_generation_parameters
+        self.config._get_non_default_generation_parameters = (
+            model.config._get_non_default_generation_parameters
+        )
 
         self.initialize_parameters()
         self.model.forward = multiple_path_with_noise_inference.__get__(self.model)
@@ -112,23 +123,33 @@ class ReasonFlow(GenerationMixin):
         input_ids = input_ids.to(self.model.device)
 
         best_thinkers_summary = []
-        
+
         if stream:
-            print(self.tokenizer.decode(input_ids['input_ids'][0]), end="")
+            print(self.tokenizer.decode(input_ids["input_ids"][0]), end="")
 
         past_key_values = None
 
         accumulated_chunks = []
-        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
-        
-        generation_config, model_kwargs = self._prepare_generation_config(generation_config, **kwargs)
+        logits_processor = (
+            logits_processor if logits_processor is not None else LogitsProcessorList()
+        )
+
+        generation_config, model_kwargs = self._prepare_generation_config(
+            generation_config, **kwargs
+        )
         self._prepare_special_tokens(generation_config, True, device=device)
         generation_config.min_tokens_to_keep = self.num_of_thoughts
-        
-        input_ids_length = input_ids['input_ids'].shape[-1]
 
-        has_default_max_length = kwargs.get("max_length") is None and generation_config.max_length is not None
-        has_default_min_length = kwargs.get("min_length") is None and generation_config.min_length is not None
+        input_ids_length = input_ids["input_ids"].shape[-1]
+
+        has_default_max_length = (
+            kwargs.get("max_length") is None
+            and generation_config.max_length is not None
+        )
+        has_default_min_length = (
+            kwargs.get("min_length") is None
+            and generation_config.min_length is not None
+        )
 
         generation_config = self._prepare_generated_length(
             generation_config=generation_config,
@@ -141,11 +162,11 @@ class ReasonFlow(GenerationMixin):
 
         prepared_logits_processor = self._get_logits_processor(
             generation_config=generation_config,
-            input_ids_seq_length=input_ids['input_ids'].shape[1],
-            encoder_input_ids=input_ids['input_ids'],
+            input_ids_seq_length=input_ids["input_ids"].shape[1],
+            encoder_input_ids=input_ids["input_ids"],
             prefix_allowed_tokens_fn=None,
             logits_processor=logits_processor,
-            device=input_ids['input_ids'].device,
+            device=input_ids["input_ids"].device,
             model_kwargs=model_kwargs,
             negative_prompt_ids=None,
             negative_prompt_attention_mask=None,
@@ -156,21 +177,55 @@ class ReasonFlow(GenerationMixin):
                 with torch.no_grad():
                     # Build a single batch dimension for every thinker
                     if num_of_generated_tokens == 0:
-                        batch_input_ids = input_ids["input_ids"].repeat_interleave(self.num_of_thinkers, dim=0)
-                        batch_attention_mask = input_ids["attention_mask"].repeat_interleave(self.num_of_thinkers, dim=0)
-                        cache_position = torch.arange(input_ids["input_ids"].shape[-1], device=input_ids["input_ids"].device) + 1
-                        position_ids = torch.arange(input_ids["input_ids"].shape[-1], device=input_ids["input_ids"].device).unsqueeze(0) + 1
+                        batch_input_ids = input_ids["input_ids"].repeat_interleave(
+                            self.num_of_thinkers, dim=0
+                        )
+                        batch_attention_mask = input_ids[
+                            "attention_mask"
+                        ].repeat_interleave(self.num_of_thinkers, dim=0)
+                        cache_position = (
+                            torch.arange(
+                                input_ids["input_ids"].shape[-1],
+                                device=input_ids["input_ids"].device,
+                            )
+                            + 1
+                        )
+                        position_ids = (
+                            torch.arange(
+                                input_ids["input_ids"].shape[-1],
+                                device=input_ids["input_ids"].device,
+                            ).unsqueeze(0)
+                            + 1
+                        )
                     else:
-                        batch_input_ids = input_ids["input_ids"][..., -1:].repeat_interleave(self.num_of_thinkers, dim=0)
-                        batch_attention_mask = input_ids["attention_mask"][..., -1:].repeat_interleave(self.num_of_thinkers, dim=0)
-                        
-                        cache_position = torch.arange(input_ids["input_ids"].shape[-1], device=input_ids["input_ids"].device) + 1
-                        position_ids = torch.arange(input_ids["input_ids"].shape[-1], device=input_ids["input_ids"].device).unsqueeze(0) + 1
+                        batch_input_ids = input_ids["input_ids"][
+                            ..., -1:
+                        ].repeat_interleave(self.num_of_thinkers, dim=0)
+                        batch_attention_mask = input_ids["attention_mask"][
+                            ..., -1:
+                        ].repeat_interleave(self.num_of_thinkers, dim=0)
+
+                        cache_position = (
+                            torch.arange(
+                                input_ids["input_ids"].shape[-1],
+                                device=input_ids["input_ids"].device,
+                            )
+                            + 1
+                        )
+                        position_ids = (
+                            torch.arange(
+                                input_ids["input_ids"].shape[-1],
+                                device=input_ids["input_ids"].device,
+                            ).unsqueeze(0)
+                            + 1
+                        )
 
                         cache_position = cache_position[..., -1:].contiguous()
                         position_ids = position_ids[..., -1:].contiguous()
-                    
-                    thinker_ids = torch.arange(self.num_of_thinkers, device=batch_input_ids.device).repeat(input_ids["input_ids"].shape[0])
+
+                    thinker_ids = torch.arange(
+                        self.num_of_thinkers, device=batch_input_ids.device
+                    ).repeat(input_ids["input_ids"].shape[0])
 
                     # Pass all thinkers in one forward call
                     results = self.model(
@@ -191,22 +246,33 @@ class ReasonFlow(GenerationMixin):
                     )
 
                     # Take only the first new tokens from each thinker
-                    final_logits = results.logits[:, -self.num_of_thoughts:-self.num_of_thoughts+1, :].contiguous()
+                    final_logits = results.logits[
+                        :, -self.num_of_thoughts : -self.num_of_thoughts + 1, :
+                    ].contiguous()
 
                     past_key_values = results.past_key_values
 
                     loss_fct = nn.CrossEntropyLoss(reduction="none")
 
-                    hidden_states = results.logits[:, :-1, :].contiguous().view(-1, self.model.config.vocab_size)
+                    hidden_states = (
+                        results.logits[:, :-1, :]
+                        .contiguous()
+                        .view(-1, self.model.config.vocab_size)
+                    )
                     input_ids_cpy = results.logits[:, 1:, :].argmax(dim=-1).reshape(-1)
 
                     loss = (
-                        loss_fct(hidden_states, input_ids_cpy).view(self.num_of_thinkers, -1).sum(dim=-1)
+                        loss_fct(hidden_states, input_ids_cpy)
+                        .view(self.num_of_thinkers, -1)
+                        .sum(dim=-1)
                     )
 
                     # Select the best thinkers
                     best_thinkers = loss.topk(
-                        min(self.config.topk_thinkers, self.num_of_thinkers if self.num_of_thinkers > 2 else 1),
+                        min(
+                            self.config.topk_thinkers,
+                            self.num_of_thinkers if self.num_of_thinkers > 2 else 1,
+                        ),
                         dim=0,
                         sorted=True,
                         largest=False,
@@ -218,12 +284,16 @@ class ReasonFlow(GenerationMixin):
 
                     result = best_logits.sum(dim=0).squeeze(1)
 
-                    result = prepared_logits_processor(input_ids['input_ids'], result)
+                    result = prepared_logits_processor(input_ids["input_ids"], result)
 
                     # token selection
                     if generation_config.do_sample:
                         result = torch.clamp(result, 0.0, 1.0)
-                        result = torch.multinomial(result.squeeze(), num_samples=1).unsqueeze(0).squeeze(-1)
+                        result = (
+                            torch.multinomial(result.squeeze(), num_samples=1)
+                            .unsqueeze(0)
+                            .squeeze(-1)
+                        )
                     else:
                         result = torch.argmax(result, dim=-1)
 
@@ -236,13 +306,19 @@ class ReasonFlow(GenerationMixin):
 
                     # Set the past_key_values to be equale the best thinkers past_key_values for the next iteration
                     past_key_values = [
-                        [past_key_values[i][j][best_thinkers].mean(dim=0, keepdim=True).repeat_interleave(self.num_of_thinkers, dim=0) for j in range(len(past_key_values[0]))]
-                    for i in range(len(past_key_values))]
+                        [
+                            past_key_values[i][j][best_thinkers]
+                            .mean(dim=0, keepdim=True)
+                            .repeat_interleave(self.num_of_thinkers, dim=0)
+                            for j in range(len(past_key_values[0]))
+                        ]
+                        for i in range(len(past_key_values))
+                    ]
 
                     torch.cuda.empty_cache()
 
                     accumulated_chunks.clear()
-             
+
             if output is None:
                 output = result
             else:
@@ -261,7 +337,7 @@ class ReasonFlow(GenerationMixin):
 
             if has_eos(result, self.model.config.eos_token_id):
                 result = truncate_output_to_eos(result, self.model.config.eos_token_id)
-                
+
                 if stream:
                     print(self.tokenizer.decode(result[0].tolist()), end="")
                 break

@@ -5,14 +5,20 @@ from einops import rearrange
 from transformers import PreTrainedModel, PreTrainedTokenizer, TextStreamer
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.cache_utils import Cache
-from transformers.generation.utils import LogitsProcessorList, GenerationMixin, GenerationConfig
+from transformers.generation.utils import (
+    LogitsProcessorList,
+    GenerationMixin,
+    GenerationConfig,
+)
 from dataclasses import dataclass
 from dataclasses import field
 
 import warnings
+
 warnings.filterwarnings("ignore")
 
 from .utils import has_eos, truncate_output_to_eos
+
 
 def multiple_path_with_noise_inference(
     self,
@@ -82,8 +88,14 @@ def multiple_path_with_noise_inference(
                 gen = torch.Generator(device=input_ids.device)
                 gen.manual_seed(3407 + int(i * 1e3))  # Increment seed per thinker
                 inputs_embeds_thinker = self.model.embed_tokens(input_ids[0].clone())
-                rand_tensor = torch.rand(inputs_embeds_thinker.shape, device=inputs_embeds_thinker.device, generator=gen)
-                inputs_embeds_thinker = inputs_embeds_thinker + rand_tensor * inputs_embeds_thinker
+                rand_tensor = torch.rand(
+                    inputs_embeds_thinker.shape,
+                    device=inputs_embeds_thinker.device,
+                    generator=gen,
+                )
+                inputs_embeds_thinker = (
+                    inputs_embeds_thinker + rand_tensor * inputs_embeds_thinker
+                )
             else:
                 inputs_embeds_thinker = self.model.embed_tokens(input_ids[0].clone())
 
@@ -120,10 +132,15 @@ def multiple_path_with_noise_inference(
 
             hidden_states = self.lm_head(hidden_states)
 
+            hidden_states_cpy = hidden_states.clone()
+
             hidden_states = hidden_states.softmax(dim=-1).to(hidden_states_dtype)
 
             if j == 0:
                 for thinker_id in thinker_ids:
+
+                    dtype_ = hidden_states.dtype
+
                     if thinker_id == 0:
                         continue
 
@@ -136,32 +153,64 @@ def multiple_path_with_noise_inference(
                     # Swap the probabilities of the top two tokens, where the first token is the max token and the second token is the Jth max token
                     prob = hidden_states[thinker_id, ..., -1:, max_token[-1]]
 
-                    prob_ration = prob / hidden_states[thinker_id, ..., -1:, max_token[0]]
+                    prob_ration = (
+                        prob / hidden_states[thinker_id, ..., -1:, max_token[0]]
+                    )
 
                     if prob_ration > acceptance_threshold:
-                        hidden_states[thinker_id, ..., -1:, max_token[-1]] = hidden_states[thinker_id, ..., -1:, max_token[0]]
+                        hidden_states[thinker_id, ..., -1:, max_token[-1]] = (
+                            hidden_states[thinker_id, ..., -1:, max_token[0]]
+                        )
                         hidden_states[thinker_id, ..., -1:, max_token[0]] = prob
                     else:
-                        hidden_states[thinker_id, ..., -1:, max_token[-1]] *= temperatures[1]
-                        hidden_states[thinker_id, ..., -1:, max_token[0]] *= temperatures[0]
-       
+                        hidden_states[
+                            thinker_id, ..., -1:, max_token[-1]
+                        ] *= temperatures[1]
+                        hidden_states[
+                            thinker_id, ..., -1:, max_token[0]
+                        ] *= temperatures[0]
+                        # elif "layer_norm" in self.model.non_normalized_hidden_states.name:
+                        #     hidden_states = hidden_states / self.model.norm.weight
+                        # else:
+                        #     ratio = (
+                        #         hidden_states_cpy
+                        #         / self.model.non_normalized_hidden_states.weight
+                        #     )
+                        #     hidden_states = hidden_states / ratio
+
             if logits is None:
                 logits = hidden_states.float()
             else:
                 logits = torch.cat([logits, hidden_states[:, -1:, :].float()], dim=1)
 
             if use_tokens:
-                hidden_states = self.model.embed_tokens(hidden_states[:, -1:, :].argmax(dim=-1))
+                hidden_states = self.model.embed_tokens(
+                    hidden_states[:, -1:, :].argmax(dim=-1)
+                )
             else:
                 hidden_states = hidden_states[:, -1:, :] @ self.lm_head.weight
-                # hidden_states = hidden_states / hidden_states.norm(dim=-1, keepdim=True)
+
+                if hasattr(self, "non_normalized_hidden_states"):
+                    non_normalized_hidden_states = (
+                        (self.non_normalized_hidden_states["tensor"][:, -1:, :])
+                        .to(hidden_states.device)
+                        .to(hidden_states.dtype)
+                    )
+
+                    # if "rms" in self.model.non_normalized_hidden_states.name:
+                    variance = non_normalized_hidden_states.pow(2).mean(
+                        -1, keepdim=True
+                    )
+                    hidden_states = hidden_states / (
+                        self.model.norm.weight
+                        * torch.rsqrt(variance + self.model.norm.variance_epsilon)
+                    )
 
             if cache_position is not None:
                 cache_position = cache_position[..., -1:] + 1
 
             if position_ids is not None:
                 position_ids = position_ids[..., -1:] + 1
-                    
 
         return CausalLMOutputWithPast(
             loss=None,
@@ -170,4 +219,3 @@ def multiple_path_with_noise_inference(
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )
-
