@@ -4,6 +4,8 @@ ReasonFlow is a novel framework designed to implement O(1)-like reasoning capabi
 It uses Multi-Path Generation with Noise to generate and fuse multiple reasoning paths, robustly handling uncertainty.  
 This approach improves inference quality, scalability, and generalization for diverse NLP tasks.
 
+![ReasonFlow by mkurman; Grok 3 image](/assets/reasonflow.jpg)
+
 ## Multi-Path Generation with Noise
 ReasonFlow introduces multiple parallel “thinkers” generating partial outputs or “thoughts” at each step.  
 • num_of_thinkers: number of parallel reasoning agents.  
