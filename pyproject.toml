@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ReasonFlow"
-version = "0.1.0"
+version = "1.0.0"
 description = "Multi-path generation with ReasonFlow."
 authors = [{ name = "Mariusz Kurman", email = "mariusz.kurman@gmail.com" }]
 readme = "README.md"
@@ -23,6 +23,7 @@ dependencies = [
     "jupyter==1.1.1",
     "einops==0.3.2",
     "dataclasses",
+    "numpy==1.26.0",
 ]
 
 [project.optional-dependencies]

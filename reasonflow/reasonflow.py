@@ -6,32 +6,44 @@ from transformers.generation.utils import (
     GenerationConfig,
     LogitsProcessorList,
 )
-from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Union
-from .utils import has_eos, truncate_output_to_eos
+from logging import getLogger
+
+from .generation.config import ReasonFlowConfig
+from .generation.temperature import dynamic_temperature_scheduling
+from .generation.uncertainty import measure_uncertainty, adapt_acceptance_threshold
+from .generation.thoughts import determine_thought_length
+from .generation.selection import select_best_thinkers
+from .generation.utils import calculate_loss, truncate_output_to_eos, has_eos
 from .multi_path_forward import multiple_path_with_noise_inference
 from .hooks.last_hs_hook import register_non_norm_hook
-from logging import getLogger
 
 logger = getLogger(__name__)
 
 
-@dataclass
-class ReasonFlowConfig:
-    num_of_thinkers: int = 1
-    num_of_thoughts: int = 3
-    topk_thinkers: int = 1
-    acceptance_threshold: float = 0.5
-    temperatures: Optional[List[float]] = field(default_factory=lambda: [0.7, 1.3])
-
-
 class ReasonFlow(GenerationMixin):
+    """
+    ReasonFlow implements multi-path reasoning capabilities in language models.
+    
+    This class extends the HuggingFace GenerationMixin to provide multi-path
+    generation with noise, allowing models to explore multiple reasoning paths
+    and fuse the best results.
+    """
+    
     def __init__(
         self,
         config: ReasonFlowConfig,
         model: PreTrainedModel,
         tokenizer: PreTrainedTokenizer,
     ):
+        """
+        Initialize ReasonFlow.
+        
+        Args:
+            config: Configuration object for ReasonFlow
+            model: The pretrained language model
+            tokenizer: The tokenizer for the model
+        """
         self.config = config
         self.model = model
 
@@ -51,6 +63,7 @@ class ReasonFlow(GenerationMixin):
         self.model.forward = multiple_path_with_noise_inference.__get__(self.model)
 
     def initialize_parameters(self) -> None:
+        """Initialize parameters based on the config."""
         self.num_of_thinkers = max(1, self.config.num_of_thinkers)
         self.num_of_thoughts = max(1, self.config.num_of_thoughts)
 
@@ -78,31 +91,32 @@ class ReasonFlow(GenerationMixin):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Generate multiple thoughts from a single input text.
-
+        Generate multiple thoughts with dynamic adaptation.
+        
         Args:
-            text (Union[str, list[str]]): The input text.
-            max_new_tokens (int): The maximum number of tokens to generate.
-            stream (bool): Whether to stream the output.
-            apply_chat_template (bool): Whether to apply the chat template.
-            device (str): The device to use.
-            logits_processor (Optional[LogitsProcessorList]): The logits processor.
-            torch_dtype (str): The torch data type.
-            generation_config (Optional[GenerationConfig]): The generation configuration.
-            use_tokens (bool): Whether to use tokens (True) or internal thoughts (hidden states, False) during thought generation.
-            **kwargs: Additional keyword arguments.
-
+            text: Input text or list of texts
+            max_new_tokens: Maximum number of tokens to generate
+            stream: Whether to stream output
+            apply_chat_template: Whether to apply chat template
+            device: Device to use
+            logits_processor: Logits processor
+            torch_dtype: Torch data type
+            generation_config: Generation config
+            use_tokens: Whether to use tokens directly or hidden states
+            **kwargs: Additional arguments for generation
+            
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: The generated tokens and the best thinkers summary.
-
+            Tuple of (output_tokens, best_thinkers_summary)
         """
-
         self.model.eval()
         self.model.to(device)
 
         num_of_generated_tokens = 0
         output = None
+        iteration = 0
+        prev_acceptance_rate = None
 
+        # Initialize input processing
         if isinstance(text, str):
             text = [text]
 
@@ -172,10 +186,34 @@ class ReasonFlow(GenerationMixin):
             negative_prompt_attention_mask=None,
         )
 
+        # Initialize current_uncertainty with a default value for the first iteration
+        current_uncertainty = 0.5  # Moderate uncertainty at the beginning
+        
         while num_of_generated_tokens < max_new_tokens:
-            with torch.autocast(dtype=getattr(torch, torch_dtype), device_type=device):
+            with torch.autocast(dtype=getattr(torch, torch_dtype), device_type=self.model.device.type):
                 with torch.no_grad():
-                    # Build a single batch dimension for every thinker
+                    # Measure input complexity for thoughts
+                    input_complexity = input_ids["input_ids"].shape[-1]
+                    
+                    # Update temperatures dynamically
+                    current_temperatures = dynamic_temperature_scheduling(
+                        iteration,
+                        self.config,
+                        prev_acceptance_rate.unsqueeze(0) if prev_acceptance_rate is not None else None
+                    )
+                    
+                    # Use acceptance threshold based on current uncertainty
+                    current_acceptance_threshold = (
+                        self.config.acceptance_threshold if iteration == 0
+                        else adapt_acceptance_threshold(
+                            self.config,
+                            iteration,
+                            current_uncertainty,
+                            prev_acceptance_rate
+                        )
+                    )
+                    
+                    # Build batch dimension for thinkers
                     if num_of_generated_tokens == 0:
                         batch_input_ids = input_ids["input_ids"].repeat_interleave(
                             self.num_of_thinkers, dim=0
@@ -227,6 +265,14 @@ class ReasonFlow(GenerationMixin):
                         self.num_of_thinkers, device=batch_input_ids.device
                     ).repeat(input_ids["input_ids"].shape[0])
 
+                    # Determine optimal thought length
+                    num_thoughts = determine_thought_length(
+                        self.config,
+                        input_complexity,
+                        iteration,
+                        current_uncertainty
+                    )
+
                     # Pass all thinkers in one forward call
                     results = self.model(
                         input_ids=batch_input_ids,
@@ -234,10 +280,10 @@ class ReasonFlow(GenerationMixin):
                         use_cache=True,
                         output_attentions=False,
                         thinker_ids=thinker_ids,
-                        acceptance_threshold=self.config.acceptance_threshold,
-                        temperatures=self.config.temperatures,
+                        acceptance_threshold=current_acceptance_threshold,
+                        temperatures=current_temperatures,
                         past_key_values=past_key_values,
-                        num_of_thoughts=self.num_of_thoughts,  # only produce max_depth tokens each pass
+                        num_of_thoughts=num_thoughts,
                         cache_position=cache_position,
                         position_ids=position_ids,
                         return_dict=True,
@@ -245,80 +291,96 @@ class ReasonFlow(GenerationMixin):
                         **model_kwargs,
                     )
 
-                    # Take only the first new tokens from each thinker
+                    # Process results
                     final_logits = results.logits[
                         :, -self.num_of_thoughts : -self.num_of_thoughts + 1, :
                     ].contiguous()
 
-                    past_key_values = results.past_key_values
+                    # Now we can measure uncertainty for next iteration
+                    current_uncertainty = measure_uncertainty(final_logits)
 
-                    loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-                    hidden_states = (
-                        results.logits[:, :-1, :]
-                        .contiguous()
-                        .view(-1, self.model.config.vocab_size)
+                    # Calculate losses and select best thinkers
+                    hidden_states = results.logits[:, :-1, :].contiguous()
+                    loss = calculate_loss(
+                        hidden_states, 
+                        results.logits, 
+                        self.model.config.vocab_size, 
+                        self.num_of_thinkers
                     )
-                    input_ids_cpy = results.logits[:, 1:, :].argmax(dim=-1).reshape(-1)
-
-                    loss = (
-                        loss_fct(hidden_states, input_ids_cpy)
-                        .view(self.num_of_thinkers, -1)
-                        .sum(dim=-1)
+                    
+                    # Select best thinkers using quality and diversity
+                    best_thinkers, best_scores = select_best_thinkers(
+                        self.config,
+                        results.logits,
+                        -loss,  # Convert loss to score (higher is better)
+                        hidden_states
                     )
-
-                    # Select the best thinkers
-                    best_thinkers = loss.topk(
-                        min(
-                            self.config.topk_thinkers,
-                            self.num_of_thinkers if self.num_of_thinkers > 2 else 1,
-                        ),
-                        dim=0,
-                        sorted=True,
-                        largest=False,
-                    ).indices.view(-1)
-
+                    
                     best_thinkers_summary.append(best_thinkers)
+                    prev_acceptance_rate = (best_scores > self.config.acceptance_threshold).float().mean()
 
+                    # Process best thinkers' outputs - improved for performance
                     best_logits = final_logits[best_thinkers]
-
-                    result = best_logits.sum(dim=0).squeeze(1)
-
+                    
+                    # Faster weighted average when we have multiple best thinkers
+                    if len(best_thinkers) > 1 and best_scores is not None:
+                        # Normalize scores for weighted average
+                        weights = torch.softmax(best_scores, dim=0).unsqueeze(-1).unsqueeze(-1)
+                        # Weighted sum is more accurate than simple sum
+                        result = (best_logits * weights).sum(dim=0).squeeze(1)
+                    else:
+                        # Simple sum for single thinker case
+                        result = best_logits.sum(dim=0).squeeze(1)
+                        
                     result = prepared_logits_processor(input_ids["input_ids"], result)
 
-                    # token selection
+                    # Token selection - optimized
                     if generation_config.do_sample:
-                        result = torch.clamp(result, 0.0, 1.0)
-                        result = (
-                            torch.multinomial(result.squeeze(), num_samples=1)
-                            .unsqueeze(0)
-                            .squeeze(-1)
-                        )
+                        # Pre-compute softmax with better numerical stability
+                        probs = torch.nn.functional.softmax(result * (1.0 / generation_config.temperature), dim=-1)
+                        result = torch.multinomial(probs, num_samples=1).view(-1, 1)
                     else:
-                        result = torch.argmax(result, dim=-1)
-
-                    if len(result.size()) == 1:
-                        result = result.unsqueeze(1)
-
-                    result = result.view(-1, 1)
+                        # Faster argmax for greedy decoding
+                        result = result.argmax(dim=-1).view(-1, 1)
 
                     past_key_values = results.past_key_values
 
-                    # Set the past_key_values to be equale the best thinkers past_key_values for the next iteration
-                    past_key_values = [
-                        [
-                            past_key_values[i][j][best_thinkers]
-                            .mean(dim=0, keepdim=True)
-                            .repeat_interleave(self.num_of_thinkers, dim=0)
-                            for j in range(len(past_key_values[0]))
+                    # Optimize KV-cache handling - avoid unnecessary copies when possible
+                    if len(best_thinkers) == 1:
+                        # Fast path for single best thinker
+                        best_thinker_idx = best_thinkers.item()
+                        past_key_values = [
+                            [
+                                past_key_values[i][j][best_thinker_idx:best_thinker_idx+1]
+                                .repeat_interleave(self.num_of_thinkers, dim=0)
+                                for j in range(len(past_key_values[0]))
+                            ]
+                            for i in range(len(past_key_values))
                         ]
-                        for i in range(len(past_key_values))
-                    ]
-
-                    torch.cuda.empty_cache()
+                    else:
+                        # More efficient averaging with explicit device and dtype
+                        device = past_key_values[0][0].device
+                        dtype = past_key_values[0][0].dtype
+                        past_key_values = [
+                            [
+                                past_key_values[i][j][best_thinkers]
+                                .mean(dim=0, keepdim=True)
+                                .to(device=device, dtype=dtype)
+                                .repeat_interleave(self.num_of_thinkers, dim=0)
+                                for j in range(len(past_key_values[0]))
+                            ]
+                            for i in range(len(past_key_values))
+                        ]
+                    
+                    # Explicit garbage collection for better memory management
+                    if iteration % 5 == 0:  # Less frequent cleanup
+                        torch.cuda.empty_cache()
 
                     accumulated_chunks.clear()
-
+                    
+            # Update iteration counter
+            iteration += 1
+            
             if output is None:
                 output = result
             else:

@@ -1,3 +1,4 @@
-from .multi_path_generation import ReasonFlow, ReasonFlowConfig
+from .reasonflow import ReasonFlow
+from .generation.config import ReasonFlowConfig
 
 __all__ = ["ReasonFlow", "ReasonFlowConfig"]

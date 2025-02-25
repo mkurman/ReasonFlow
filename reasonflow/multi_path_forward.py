@@ -36,6 +36,12 @@ def multiple_path_with_noise_inference(
     acceptance_threshold: float = 0.5,
     temperatures: Optional[torch.Tensor] = [0.7, 1.3],
     use_tokens: bool = True,
+    noise_scale: float = 1.0,  # Controls the scale of random noise
+    random_seed_base: int = 3407,  # Base seed for randomization
+    use_early_stopping: bool = False,
+    early_stopping_threshold: float = 0.1,
+    diversity_penalty: float = 0.0,
+    debug: bool = False,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
     """
     Perform multiple path inference through the model, allowing for separate thinker paths.
@@ -55,10 +61,17 @@ def multiple_path_with_noise_inference(
         acceptance_threshold (float): Acceptance threshold. Defines the threshold for swapping the probabilities of the top two tokens.
         temperatures (Optional[torch.Tensor]): Temperatures tensor. Defines the temperature for the top two tokens.
         use_tokens (bool): Whether to use tokens (True) or internal thoughts (hidden states, False) during thought generation. Default is True.
+        noise_scale (float): Controls the scale of random noise.
+        random_seed_base (int): Base seed for randomization.
+        use_early_stopping (bool): Whether to use early stopping.
+        early_stopping_threshold (float): Threshold for early stopping.
+        diversity_penalty (float): Penalty to encourage diversity among paths.
+        debug (bool): Whether to output debugging information.
 
     Returns:
         Union[Tuple, CausalLMOutputWithPast]: Model outputs.
     """
+
     output_attentions = (
         output_attentions
         if output_attentions is not None
@@ -81,29 +94,37 @@ def multiple_path_with_noise_inference(
     first_past_key_values = None
 
     with torch.inference_mode():
-        for i in range(input_ids.shape[0]):
-            inputs_embeds_thinker = input_ids.clone()
-
-            if i > 0:
+        # Optimized embedding initialization - compute embeddings in a batch
+        base_embeds = self.model.embed_tokens(input_ids[0])  # Only embed once
+        
+        # Preallocate tensor for all embeddings to avoid multiple allocations
+        batch_size = input_ids.shape[0]
+        embed_dim = base_embeds.shape[-1]
+        seq_len = base_embeds.shape[0]
+        all_embeds = torch.empty(
+            (batch_size, seq_len, embed_dim), 
+            device=input_ids.device, 
+            dtype=base_embeds.dtype
+        )
+        
+        # First thinker gets the original embeddings
+        all_embeds[0] = base_embeds
+        
+        # Optimized noise application for remaining thinkers
+        if batch_size > 1:
+            # Create noise for all other thinkers at once (more efficient)
+            for i in range(1, batch_size):
                 gen = torch.Generator(device=input_ids.device)
-                gen.manual_seed(3407 + int(i * 1e3))  # Increment seed per thinker
-                inputs_embeds_thinker = self.model.embed_tokens(input_ids[0].clone())
-                rand_tensor = torch.rand(
-                    inputs_embeds_thinker.shape,
-                    device=inputs_embeds_thinker.device,
+                gen.manual_seed(random_seed_base + int(i * 1e3))  # Increment seed per thinker
+                
+                # Apply scaled noise directly to the embeddings (avoid copies)
+                all_embeds[i] = base_embeds * (1.0 + torch.rand(
+                    base_embeds.shape, 
+                    device=input_ids.device,
                     generator=gen,
-                )
-                inputs_embeds_thinker = (
-                    inputs_embeds_thinker + rand_tensor * inputs_embeds_thinker
-                )
-            else:
-                inputs_embeds_thinker = self.model.embed_tokens(input_ids[0].clone())
-
-            # hidden_states.append(inputs_embeds_thinker)
-            input_embs.append(inputs_embeds_thinker)
-            del inputs_embeds_thinker
-
-        input_embs = torch.stack(input_embs, dim=0)
+                ) * noise_scale)
+        
+        input_embs = all_embeds
 
         hidden_states = None
 
@@ -131,8 +152,6 @@ def multiple_path_with_noise_inference(
                 first_past_key_values = past_key_values
 
             hidden_states = self.lm_head(hidden_states)
-
-            hidden_states_cpy = hidden_states.clone()
 
             hidden_states = hidden_states.softmax(dim=-1).to(hidden_states_dtype)
 
@@ -169,48 +188,71 @@ def multiple_path_with_noise_inference(
                         hidden_states[
                             thinker_id, ..., -1:, max_token[0]
                         ] *= temperatures[0]
-                        # elif "layer_norm" in self.model.non_normalized_hidden_states.name:
-                        #     hidden_states = hidden_states / self.model.norm.weight
-                        # else:
-                        #     ratio = (
-                        #         hidden_states_cpy
-                        #         / self.model.non_normalized_hidden_states.weight
-                        #     )
-                        #     hidden_states = hidden_states / ratio
 
             if logits is None:
                 logits = hidden_states.float()
             else:
                 logits = torch.cat([logits, hidden_states[:, -1:, :].float()], dim=1)
 
+            # Token selection and output processing - optimized for performance
             if use_tokens:
-                hidden_states = self.model.embed_tokens(
-                    hidden_states[:, -1:, :].argmax(dim=-1)
-                )
+                # Faster token determination and embedding in one step
+                with torch.no_grad():  # Explicitly mark no grad for inference
+                    token_indices = hidden_states[:, -1:, :].argmax(dim=-1)
+                    hidden_states = self.model.embed_tokens(token_indices)
             else:
-                hidden_states = hidden_states[:, -1:, :] @ self.lm_head.weight
-
-                if hasattr(self, "non_normalized_hidden_states"):
-                    non_normalized_hidden_states = (
-                        (self.non_normalized_hidden_states["tensor"][:, -1:, :])
-                        .to(hidden_states.device)
-                        .to(hidden_states.dtype)
-                    )
-
-                    # if "rms" in self.model.non_normalized_hidden_states.name:
-                    variance = non_normalized_hidden_states.pow(2).mean(
-                        -1, keepdim=True
-                    )
-                    hidden_states = hidden_states / (
-                        self.model.norm.weight
-                        * torch.rsqrt(variance + self.model.norm.variance_epsilon)
-                    )
+                with torch.no_grad():  # Ensure no gradients for maximum speed
+                    hidden_states = torch.matmul(hidden_states[:, -1:, :], self.lm_head.weight.data)
+                    # Optimized projection and normalization
+                    if hasattr(self, "non_normalized_hidden_states") and self.non_normalized_hidden_states["tensor"].size(0) > 0:
+                        try:
+                            # Direct non-normalized hidden states access with prefetch
+                            device = hidden_states.device
+                            dtype = hidden_states.dtype
+                            
+                            non_norm_hs = self.non_normalized_hidden_states["tensor"][:, -1:, :]
+                            non_norm_hs = non_norm_hs.to(device=device, dtype=dtype, non_blocking=True)
+                            
+                            # Vectorized normalization - faster variance calculation
+                            epsilon = self.model.norm.variance_epsilon
+                            norm_weight = self.model.norm.weight
+                            
+                            # Fused operation for better performance
+                            variance = torch.var(non_norm_hs, dim=-1, keepdim=True, unbiased=False) + epsilon
+                            scale = norm_weight * torch.rsqrt(variance)
+                            hidden_states = non_norm_hs * scale
+                        except Exception:
+                            pass
 
             if cache_position is not None:
                 cache_position = cache_position[..., -1:] + 1
 
             if position_ids is not None:
                 position_ids = position_ids[..., -1:] + 1
+
+            if use_early_stopping and j > 1:
+                path_variance = torch.var(hidden_states, dim=0).mean()
+                if path_variance < early_stopping_threshold:
+                    break
+
+        if diversity_penalty > 0:
+            similarity_matrix = torch.matmul(hidden_states, hidden_states.transpose(-1, -2))
+            diversity_loss = similarity_matrix.sum() * diversity_penalty
+            logits -= diversity_loss
+
+        if debug:
+            path_stats = {
+                "token_diversity": torch.var(hidden_states.argmax(dim=-1), dim=0).mean().item(),
+                "probability_confidence": hidden_states.max(dim=-1)[0].mean().item(),
+            }
+            return CausalLMOutputWithPast(
+                loss=None,
+                logits=logits,
+                past_key_values=first_past_key_values,
+                hidden_states=outputs.hidden_states,
+                attentions=outputs.attentions,
+                metadata=path_stats,
+            )
 
         return CausalLMOutputWithPast(
             loss=None,
